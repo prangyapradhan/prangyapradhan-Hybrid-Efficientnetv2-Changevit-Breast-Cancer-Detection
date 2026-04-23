@@ -1,0 +1,193 @@
+import torch
+import torch.nn as nn
+import torchvision.models as models
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
+from sklearn.model_selection import KFold
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+
+device = torch.device("cuda")
+
+# ==========================================
+#  DATA
+# ==========================================
+
+transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor()
+])
+
+dataset = datasets.ImageFolder("/content/dataset/preprocessed_images", transform=transform)
+
+# ==========================================
+#  MODEL COMPONENTS
+# ==========================================
+
+class EfficientNetV2_Feature(nn.Module):
+    def __init__(self):
+        super().__init__()
+        base = models.efficientnet_v2_s(pretrained=True)
+        self.features = base.features
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x):
+        x = self.features(x)
+        self.feature_map = x
+        x = self.pool(x)
+        return x.view(x.size(0), -1)
+
+class ChangeViT(nn.Module):
+    def __init__(self, dim=256):
+        super().__init__()
+        self.patch = nn.Conv2d(3, dim, 16, 16)
+        self.trans = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=dim, nhead=4),
+            num_layers=2
+        )
+
+    def forward(self, x, x2):
+        p1 = self.patch(x).flatten(2).permute(2,0,1)
+        p2 = self.patch(x2).flatten(2).permute(2,0,1)
+        diff = p1 - p2
+        return self.trans(diff).mean(dim=0)
+
+class Fusion(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q = nn.Linear(1280,256)
+        self.k = nn.Linear(256,256)
+        self.v = nn.Linear(256,256)
+
+    def forward(self, Fc, Ft):
+        Q = self.q(Fc)
+        K = self.k(Ft)
+        V = self.v(Ft)
+        A = torch.softmax(Q @ K.T / np.sqrt(256), dim=-1) @ V
+        return Fc + A
+
+class HybridModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.cnn = EfficientNetV2_Feature()
+        self.vit = ChangeViT()
+        self.fusion = Fusion()
+
+        self.classifier = nn.Sequential(
+            nn.Linear(1280,256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256,2)
+        )
+
+    def forward(self, x):
+        Fc = self.cnn(x)
+        x2 = torch.flip(x, dims=[3])
+        Ft = self.vit(x, x2)
+        F = self.fusion(Fc, Ft)
+        return self.classifier(F)
+
+# ==========================================
+#  K-FOLD TRAINING
+# ==========================================
+
+kfold = KFold(n_splits=5, shuffle=True)
+fold_acc = []
+
+epochs = 150  
+
+for fold, (train_idx, val_idx) in enumerate(kfold.split(dataset)):
+
+    print(f"\n Fold {fold+1}")
+
+    train_loader = DataLoader(Subset(dataset, train_idx), batch_size=16, shuffle=True)
+    val_loader = DataLoader(Subset(dataset, val_idx), batch_size=16)
+
+    model = HybridModel().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    # ----------- TRAIN -----------
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}")
+
+    # ----------- VALIDATION -----------
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for imgs, labels in val_loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+
+            outputs = model(imgs)
+            _, preds = torch.max(outputs, 1)
+
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+    acc = 100 * correct / total
+    fold_acc.append(acc)
+
+    print(f"Fold {fold+1} Accuracy: {acc:.2f}%")
+
+print("\nFinal Mean Accuracy:", np.mean(fold_acc))
+
+# ==========================================
+#  GRAD-CAM (FIXED VERSION)
+# ==========================================
+
+def generate_gradcam(model, image):
+    model.eval()
+
+    image = image.unsqueeze(0).to(device)
+    image.requires_grad = True
+
+    output = model(image)
+    class_idx = output.argmax()
+
+    model.zero_grad()
+    output[0, class_idx].backward()
+
+    gradients = model.cnn.feature_map.grad
+    activations = model.cnn.feature_map
+
+    weights = torch.mean(gradients, dim=(2,3), keepdim=True)
+    cam = torch.sum(weights * activations, dim=1).squeeze()
+
+    cam = torch.relu(cam)
+    cam = cam / cam.max()
+
+    cam = cam.detach().cpu().numpy()
+    cam = cv2.resize(cam, (224,224))
+
+    return cam
+
+# ----------- VISUALIZATION -----------
+
+sample_img, _ = dataset[0]
+cam = generate_gradcam(model, sample_img)
+
+img_np = sample_img.permute(1,2,0).numpy()
+
+plt.imshow(img_np)
+plt.imshow(cam, cmap='jet', alpha=0.5)
+plt.title("Grad-CAM")
+plt.axis('off')
+plt.show()
