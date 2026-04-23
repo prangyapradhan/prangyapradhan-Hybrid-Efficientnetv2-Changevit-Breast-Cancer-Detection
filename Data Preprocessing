@@ -1,0 +1,110 @@
+
+
+import os
+import cv2
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+
+input_dir = "/content/dataset/raw_images"        # change path
+output_dir = "/content/dataset/preprocessed_images"
+os.makedirs(output_dir, exist_ok=True)
+
+# ----------- FUNCTIONS -----------
+
+def resize_and_normalize(image, size=(224, 224)):
+    image = cv2.resize(image, size)
+    return image / 255.0
+
+def apply_nlm(image):
+    img = (image * 255).astype(np.uint8)
+    denoised = cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
+    return denoised / 255.0
+
+def apply_clahe(image):
+    img = (image * 255).astype(np.uint8)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+
+    merged = cv2.merge((cl, a, b))
+    enhanced = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+    return enhanced / 255.0
+
+def gamma_correction(image, gamma=1.2):
+    inv_gamma = 1.0 / gamma
+    table = np.array([(i / 255.0) ** inv_gamma * 255
+                      for i in np.arange(256)]).astype("uint8")
+    
+    img = (image * 255).astype(np.uint8)
+    corrected = cv2.LUT(img, table)
+    return corrected / 255.0
+
+def extract_breast_region(image):
+    gray = cv2.cvtColor((image*255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        mask = np.zeros_like(gray)
+        cv2.drawContours(mask, [largest], -1, 255, -1)
+
+        result = cv2.bitwise_and((image*255).astype(np.uint8),
+                                (image*255).astype(np.uint8),
+                                mask=mask)
+        return result / 255.0
+    return image
+
+def preprocess_image(path):
+    image = cv2.imread(path)
+
+    image = resize_and_normalize(image)
+    image = apply_nlm(image)
+    image = apply_clahe(image)
+    image = gamma_correction(image, gamma=1.2)
+    image = extract_breast_region(image)
+
+    return image
+
+# ----------- PROCESS DATASET -----------
+
+image_paths = []
+for root, dirs, files in os.walk(input_dir):
+    for file in files:
+        if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+            image_paths.append(os.path.join(root, file))
+
+print("Total Images Found:", len(image_paths))
+
+for path in tqdm(image_paths):
+    processed = preprocess_image(path)
+    save_path = os.path.join(output_dir, os.path.basename(path))
+    cv2.imwrite(save_path, (processed * 255).astype(np.uint8))
+
+print("Preprocessing Completed!")
+
+# ----------- VISUALIZATION -----------
+
+if len(image_paths) > 0:
+    sample = image_paths[0]
+    original = cv2.imread(sample)
+    processed = preprocess_image(sample)
+
+    plt.figure(figsize=(10,5))
+
+    plt.subplot(1,2,1)
+    plt.title("Original Image")
+    plt.imshow(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
+    plt.axis('off')
+
+    plt.subplot(1,2,2)
+    plt.title("Preprocessed Image")
+    plt.imshow(cv2.cvtColor((processed*255).astype(np.uint8), cv2.COLOR_BGR2RGB))
+    plt.axis('off')
+
+    plt.show()
