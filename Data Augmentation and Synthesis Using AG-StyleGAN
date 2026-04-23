@@ -1,0 +1,206 @@
+# ==========================================
+# Data Augmentation + AG-StyleGAN 
+# ==========================================
+
+import os
+import cv2
+import numpy as np
+import random
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
+
+# ----------- PATH SETUP -----------
+input_dir = "/content/dataset/preprocessed_images"
+aug_dir = "/content/dataset/augmented"
+syn_dir = "/content/dataset/synthetic"
+
+os.makedirs(aug_dir, exist_ok=True)
+os.makedirs(syn_dir, exist_ok=True)
+
+# ==========================================
+#  DATA AUGMENTATION FUNCTIONS
+# ==========================================
+
+def random_rotation(img):
+    angle = random.choice([90, 180, 270])
+    return cv2.rotate(img, {90: cv2.ROTATE_90_CLOCKWISE,
+                            180: cv2.ROTATE_180,
+                            270: cv2.ROTATE_90_COUNTERCLOCKWISE}[angle])
+
+def horizontal_flip(img):
+    return cv2.flip(img, 1)
+
+def brightness_contrast(img):
+    alpha = random.uniform(0.8, 1.2)
+    beta = random.randint(-20, 20)
+    return cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
+
+def gaussian_noise(img):
+    noise = np.random.normal(0, 10, img.shape).astype(np.uint8)
+    return cv2.add(img, noise)
+
+def elastic_deformation(img):
+    return cv2.GaussianBlur(img, (5,5), 0)  # simplified deformation
+
+def augment_image(img):
+    aug_images = []
+
+    aug_images.append(random_rotation(img))
+    aug_images.append(horizontal_flip(img))
+    aug_images.append(brightness_contrast(img))
+    aug_images.append(gaussian_noise(img))
+    aug_images.append(elastic_deformation(img))
+
+    return aug_images
+
+# ----------- APPLY AUGMENTATION -----------
+
+image_paths = []
+for root, dirs, files in os.walk(input_dir):
+    for f in files:
+        if f.lower().endswith(('.png','.jpg','.jpeg')):
+            image_paths.append(os.path.join(root, f))
+
+print("Total Images:", len(image_paths))
+
+for path in tqdm(image_paths):
+    img = cv2.imread(path)
+    base_name = os.path.splitext(os.path.basename(path))[0]
+
+    aug_imgs = augment_image(img)
+
+    for i, aimg in enumerate(aug_imgs):
+        save_path = os.path.join(aug_dir, f"{base_name}_aug{i}.png")
+        cv2.imwrite(save_path, aimg)
+
+print("Augmentation Done!")
+
+# ==========================================
+#  AG-STYLEGAN (SIMPLIFIED)
+# ==========================================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ----------- GENERATOR -----------
+class Generator(nn.Module):
+    def __init__(self, z_dim=100, num_classes=2):
+        super().__init__()
+        self.label_emb = nn.Embedding(num_classes, z_dim)
+
+        self.model = nn.Sequential(
+            nn.Linear(z_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Linear(512, 3*64*64),
+            nn.Tanh()
+        )
+
+    def forward(self, z, labels):
+        z = z + self.label_emb(labels)
+        img = self.model(z)
+        return img.view(-1, 3, 64, 64)
+
+# ----------- DISCRIMINATOR -----------
+class Discriminator(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        self.label_emb = nn.Embedding(num_classes, 3*64*64)
+
+        self.model = nn.Sequential(
+            nn.Linear(3*64*64, 512),
+            nn.LeakyReLU(0.2),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, img, labels):
+        img_flat = img.view(img.size(0), -1)
+        img_flat = img_flat + self.label_emb(labels)
+        return self.model(img_flat)
+
+# ----------- DATASET -----------
+class ImageDataset(Dataset):
+    def __init__(self, folder):
+        self.files = [os.path.join(folder, f) for f in os.listdir(folder)]
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((64,64))
+        ])
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        img = cv2.imread(self.files[idx])
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = self.transform(img)
+        label = torch.tensor(random.randint(0,1))
+        return img, label
+
+# ----------- TRAIN GAN -----------
+
+dataset = ImageDataset(aug_dir)
+loader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+G = Generator().to(device)
+D = Discriminator().to(device)
+
+criterion = nn.BCELoss()
+g_opt = optim.Adam(G.parameters(), lr=0.0002)
+d_opt = optim.Adam(D.parameters(), lr=0.0002)
+
+epochs = 200   
+
+for epoch in range(epochs):
+    for imgs, labels in loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+
+        batch_size = imgs.size(0)
+
+        # REAL / FAKE labels
+        real = torch.ones(batch_size,1).to(device)
+        fake = torch.zeros(batch_size,1).to(device)
+
+        # ----------- TRAIN D -----------
+        z = torch.randn(batch_size,100).to(device)
+        fake_imgs = G(z, labels)
+
+        d_loss = criterion(D(imgs, labels), real) + \
+                 criterion(D(fake_imgs.detach(), labels), fake)
+
+        d_opt.zero_grad()
+        d_loss.backward()
+        d_opt.step()
+
+        # ----------- TRAIN G -----------
+        g_loss = criterion(D(fake_imgs, labels), real)
+
+        g_opt.zero_grad()
+        g_loss.backward()
+        g_opt.step()
+
+    print(f"Epoch {epoch+1} | D Loss: {d_loss.item():.4f} | G Loss: {g_loss.item():.4f}")
+
+# ----------- GENERATE SYNTHETIC IMAGES -----------
+
+G.eval()
+for i in range(20):
+    z = torch.randn(1,100).to(device)
+    label = torch.tensor([random.randint(0,1)]).to(device)
+
+    fake_img = G(z, label).detach().cpu().numpy()[0]
+    fake_img = np.transpose(fake_img, (1,2,0))
+    fake_img = ((fake_img + 1)/2 * 255).astype(np.uint8)
+
+    cv2.imwrite(os.path.join(syn_dir, f"synthetic_{i}.png"), fake_img)
+
+print("Synthetic Image Generation Completed!")
